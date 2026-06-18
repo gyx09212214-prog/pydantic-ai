@@ -134,6 +134,9 @@ else:
 __all__ = ['AGUIAdapter']
 
 
+_TOOL_RETURN_OUTCOME_ENCRYPTED_VALUE_KEY = 'pydantic_ai_tool_return_outcome'
+
+
 # Frontend toolset
 
 
@@ -166,6 +169,40 @@ class _AGUIFrontendToolset(ExternalToolset[AgentDepsT]):
 def _new_message_id() -> str:
     """Generate a new unique message ID."""
     return str(uuid.uuid4())
+
+
+def _tool_return_outcome(tool_msg: ToolMessage) -> Literal['success', 'failed', 'denied']:
+    if tool_msg.error is None:
+        return 'success'
+
+    encrypted_value = getattr(tool_msg, 'encrypted_value', None) or getattr(tool_msg, 'encryptedValue', None)
+    if isinstance(encrypted_value, str):
+        try:
+            metadata = json.loads(encrypted_value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(metadata, dict):
+                outcome = metadata.get(_TOOL_RETURN_OUTCOME_ENCRYPTED_VALUE_KEY)
+                if outcome in {'failed', 'denied'}:
+                    return outcome
+
+    return 'failed'
+
+
+def _tool_message_from_tool_return_part(part: ToolReturnPart) -> ToolMessage:
+    content = part.model_response_str()
+    message_args: dict[str, Any] = {
+        'id': _new_message_id(),
+        'content': content,
+        'tool_call_id': part.tool_call_id,
+    }
+    if part.outcome != 'success':
+        message_args['error'] = content
+        # AG-UI has `error` but no failed/denied discriminator, so keep the exact
+        # Pydantic AI outcome in the standard ToolMessage encryptedValue slot.
+        message_args['encryptedValue'] = json.dumps({_TOOL_RETURN_OUTCOME_ENCRYPTED_VALUE_KEY: part.outcome})
+    return ToolMessage(**message_args)
 
 
 def _user_content_to_input(
@@ -457,6 +494,7 @@ class AGUIAdapter(UIAdapter[RunAgentInput, Message, BaseEvent, AgentDepsT, Outpu
                                 tool_name=tool_name,
                                 content=tool_msg.content,
                                 tool_call_id=tool_call_id,
+                                outcome=_tool_return_outcome(tool_msg),
                             )
                         )
 
@@ -581,13 +619,7 @@ class AGUIAdapter(UIAdapter[RunAgentInput, Message, BaseEvent, AgentDepsT, Outpu
                             if converted is not None:
                                 user_content.append(converted)
             elif isinstance(part, ToolReturnPart):
-                result.append(
-                    ToolMessage(
-                        id=_new_message_id(),
-                        content=part.model_response_str(),
-                        tool_call_id=part.tool_call_id,
-                    )
-                )
+                result.append(_tool_message_from_tool_return_part(part))
             elif isinstance(part, RetryPromptPart):
                 if part.tool_name:
                     result.append(
